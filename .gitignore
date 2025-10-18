@@ -1,0 +1,15 @@
+
+# Ignore data directories
+cancer_microbiome/data/
+prelim_analysis/data/
+
+# Ignore entire out directory
+out/
+
+# Optional: Common Python files to ignore
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+.DS_Store
