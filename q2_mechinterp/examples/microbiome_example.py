@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""
+Microbiome Feature Engineering with VAEs
+=========================================
+
+This script demonstrates how to use the `q2_mechinterp` package to extract
+interpretable features from microbiome data using Variational Autoencoders
+and Sparse Autoencoders.
+
+Overview:
+1. Load and preprocess microbiome data
+2. Train a VAE for dimensionality reduction
+3. Train a Sparse Autoencoder on the latent space
+4. Analyze feature importance with taxonomy integration
+5. Evaluate features on downstream classification
+6. Visualize results
+
+Usage:
+    python microbiome_example.py
+
+Requirements:
+    pip install vae-features[full]
+"""
+
+import numpy as np
+import pandas as pd
+import torch
+from pathlib import Path
+
+# VAE Features imports
+from q2_mechinterp.microbiome import MicrobiomeVAE, MicrobiomeDataProcessor
+from q2_mechinterp.training import VAETrainer
+from q2_mechinterp.extraction import FeatureExtractor
+from q2_mechinterp.core.utils import get_device, set_seed
+from q2_mechinterp.core.logging import StructuredLogger, timer, print_model_summary
+from q2_mechinterp.visualization import (
+    plot_training_curves,
+    plot_latent_space,
+    plot_feature_importance,
+    plot_reconstruction_comparison,
+    plot_elbow,
+)
+from q2_mechinterp.evaluation import FeatureEvaluator, calculate_feature_quality_metrics
+
+
+def generate_synthetic_microbiome_data(
+    n_samples: int = 200,
+    n_features: int = 500,
+    n_classes: int = 2,
+    sparsity: float = 0.7,
+    random_state: int = 42,
+) -> tuple:
+    """
+    Generate synthetic microbiome-like data for demonstration.
+
+    Returns:
+        data_df: Count DataFrame (samples x features)
+        metadata_df: Metadata DataFrame
+        taxonomy_df: Taxonomy DataFrame
+    """
+    np.random.seed(random_state)
+
+    # Simulate sparse microbiome counts (log-normal + zeros)
+    counts = np.random.lognormal(mean=2, sigma=2, size=(n_samples, n_features))
+    counts = counts * (np.random.random((n_samples, n_features)) > sparsity)
+    counts = counts.astype(int)
+
+    # Create feature names (simulating taxonomy strings)
+    genera = [
+        "Bacteroides",
+        "Prevotella",
+        "Faecalibacterium",
+        "Ruminococcus",
+        "Blautia",
+        "Lachnospira",
+        "Roseburia",
+        "Coprococcus",
+        "Dorea",
+        "Clostridium",
+        "Eubacterium",
+        "Akkermansia",
+        "Bifidobacterium",
+    ]
+
+    feature_names = []
+    taxonomy_records = []
+
+    for i in range(n_features):
+        genus = np.random.choice(genera)
+        species = f"species_{i}"
+        feature_id = f"OTU_{i:04d}"
+
+        # Full taxonomy string
+        taxonomy = (
+            f"k__Bacteria;p__Firmicutes;c__Clostridia;o__Clostridiales;"
+            f"f__Lachnospiraceae;g__{genus};s__{species}"
+        )
+
+        feature_names.append(feature_id)
+        taxonomy_records.append(
+            {"genome_id": feature_id, "taxonomy": taxonomy, "genus": genus, "species": species}
+        )
+
+    # Create sample labels with class-specific feature patterns
+    labels = np.random.choice(["healthy", "disease"], n_samples)
+
+    # Add some signal: certain features higher in disease samples
+    disease_features = np.random.choice(n_features, n_features // 10, replace=False)
+    disease_mask = labels == "disease"
+    counts[disease_mask][:, disease_features] *= 2
+
+    # Create DataFrames
+    sample_ids = [f"sample_{i:03d}" for i in range(n_samples)]
+
+    data_df = pd.DataFrame(counts, columns=feature_names, index=sample_ids)
+
+    metadata_df = pd.DataFrame(
+        {
+            "sample_id": sample_ids,
+            "group": labels,
+            "age": np.random.randint(20, 70, n_samples),
+            "bmi": np.random.normal(25, 5, n_samples),
+        }
+    ).set_index("sample_id")
+
+    taxonomy_df = pd.DataFrame(taxonomy_records)
+
+    return data_df, metadata_df, taxonomy_df
+
+
+def main():
+    """Main function demonstrating the VAE feature extraction workflow."""
+
+    # =========================================================================
+    # Configuration
+    # =========================================================================
+
+    OUTPUT_DIR = Path("./microbiome_vae_outputs")
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    # Set seed for reproducibility
+    set_seed(42)
+
+    # Get compute device (CUDA > MPS > CPU)
+    device = get_device()
+    print(f"Using device: {device}")
+
+    # Initialize structured logger
+    logger = StructuredLogger("microbiome_vae", log_dir=OUTPUT_DIR)
+
+    # =========================================================================
+    # 1. Load and Preprocess Data
+    # =========================================================================
+
+    print("\n" + "=" * 60)
+    print("Step 1: Loading and Preprocessing Data")
+    print("=" * 60)
+
+    # Generate synthetic data for this example
+    # In practice, you would load real BIOM files:
+    #
+    #   processor = MicrobiomeDataProcessor({
+    #       'metag_biom': 'path/to/metagenomics.biom',
+    #       'metat_biom': 'path/to/metatranscriptomics.biom',
+    #       'metadata': 'path/to/metadata.txt',
+    #       'lineages': 'path/to/lineages.txt'
+    #   })
+    #   processor.load_data(label_column='diagnosis')
+
+    data_df, metadata_df, taxonomy_df = generate_synthetic_microbiome_data(
+        n_samples=200, n_features=500, sparsity=0.7
+    )
+
+    print(f"Generated data shape: {data_df.shape}")
+    print(f"Sparsity: {(data_df == 0).sum().sum() / data_df.size:.1%}")
+    print(f"Label distribution:\n{metadata_df['group'].value_counts()}")
+
+    # Initialize processor and load from DataFrames
+    processor = MicrobiomeDataProcessor(data_paths={}, device=device)
+    processor.load_data_from_dataframes(
+        metag_df=data_df, metadata_df=metadata_df, taxonomy_df=taxonomy_df
+    )
+
+    # Apply log transformation (RCLR requires gemelli package)
+    # For this demo, we use simple log transformation
+    print("Applying log transformation...")
+    data_array = data_df.values.astype(float)
+    data_array = np.log1p(data_array)
+    data_array = data_array - data_array.mean(axis=1, keepdims=True)
+
+    processor.table_metag_rclr = pd.DataFrame(
+        data_array, index=data_df.index, columns=data_df.columns
+    )
+    processor.table_metag_filtered = processor.table_metag_rclr.copy()
+
+    # Filter features by prevalence and variance
+    processor.filter_features(min_prevalence=0.1, top_variance_pct=10)
+
+    n_features = processor.table_metag_filtered.shape[1]
+    print(f"Features after filtering: {n_features}")
+
+    # Prepare train/val/test splits
+    processor.prepare_datasets(label_column="group", test_size=0.2, stratify=True, random_state=42)
+
+    # Get the prepared data
+    X, y = processor.get_data_for_training(data_type="metag")
+
+    # Split into train/val/test manually
+    from sklearn.model_selection import train_test_split
+
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp,
+        y_temp,
+        test_size=0.125,
+        stratify=y_temp,
+        random_state=42,  # 0.125 * 0.8 = 0.1 of total
+    )
+
+    print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+
+    # Create DataLoaders
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+
+    train_dataset = TensorDataset(torch.FloatTensor(X_train))
+    val_dataset = TensorDataset(torch.FloatTensor(X_val))
+    test_dataset = TensorDataset(torch.FloatTensor(X_test))
+
+    batch_size = 32
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    # Store for later use
+    input_dim = X_train.shape[1]
+
+    print(f"Training samples: {len(train_loader.dataset)}")
+    print(f"Validation samples: {len(val_loader.dataset)}")
+    print(f"Test samples: {len(test_loader.dataset)}")
+
+    # Log parameters
+    logger.log_params(
+        {
+            "n_samples": len(data_df),
+            "n_features_original": data_df.shape[1],
+            "n_features_filtered": n_features,
+        }
+    )
+
+    # =========================================================================
+    # 2. Train Variational Autoencoder
+    # =========================================================================
+
+    print("\n" + "=" * 60)
+    print("Step 2: Training Variational Autoencoder")
+    print("=" * 60)
+
+    # Get processed data for later use
+    processed_data = processor.metag_scaled
+    if processed_data is None:
+        processed_data = processor.table_metag_filtered.values
+
+    # Create VAE model
+    vae = MicrobiomeVAE(
+        input_dim=input_dim,
+        hidden_dims=[256, 128, 64],
+        latent_dim=32,
+        dropout_rate=0.3,
+        use_layer_norm=True,
+    )
+
+    print_model_summary(vae)
+
+    # Create trainer
+    trainer = VAETrainer(
+        model=vae, device=device, learning_rate=1e-3, weight_decay=1e-5, gradient_clip=1.0
+    )
+
+    # Train with early stopping
+    with timer("VAE Training"):
+        train_losses, val_losses = trainer.train(
+            train_loader,
+            val_loader,
+            epochs=100,
+            beta=0.01,
+            alpha=0.001,
+            patience=15,
+            verbose=10,
+            save_path=None,
+        )
+
+    # Plot training curves
+    fig = plot_training_curves(
+        train_losses,
+        val_losses,
+        title="VAE Training Progress",
+        save_path=OUTPUT_DIR / "training_curves.png",
+    )
+
+    # Save VAE model
+    torch.save(vae.state_dict(), OUTPUT_DIR / "microbiome_vae.pt")
+
+    # =========================================================================
+    # 3. Extract Latent Features
+    # =========================================================================
+
+    print("\n" + "=" * 60)
+    print("Step 3: Extracting Latent Features")
+    print("=" * 60)
+
+    # Create feature extractor
+    extractor = FeatureExtractor(vae, device)
+
+    # Get latent features for all data
+    latent_features = extractor.get_latent_features(processed_data)
+    print(f"Latent features shape: {latent_features.shape}")
+
+    # Visualize latent space
+    labels = metadata_df["group"].values
+    label_encoder = {label: i for i, label in enumerate(np.unique(labels))}
+    encoded_labels = np.array([label_encoder[l] for l in labels])
+
+    fig = plot_latent_space(
+        latent_features,
+        labels=encoded_labels,
+        label_names=list(label_encoder.keys()),
+        method="pca",
+        title="VAE Latent Space",
+        save_path=OUTPUT_DIR / "latent_space.png",
+    )
+
+    # =========================================================================
+    # 4. Train Sparse Autoencoder
+    # =========================================================================
+
+    print("\n" + "=" * 60)
+    print("Step 4: Training Sparse Autoencoder")
+    print("=" * 60)
+
+    with timer("Sparse AE Training"):
+        sparse_losses = extractor.train_sparse_autoencoder(
+            latent_features,
+            sparse_multiplier=3,
+            l1_reg=0.001,
+            epochs=100,
+            lr=1e-3,
+            batch_size=32,
+            verbose=10,
+        )
+
+    # Get sparse features
+    sparse_features = extractor.get_sparse_features(latent_features)
+    print(f"Sparse features shape: {sparse_features.shape}")
+    print(f"Sparsity: {(sparse_features == 0).mean():.1%}")
+
+    # Save features
+    np.save(OUTPUT_DIR / "latent_features.npy", latent_features)
+    np.save(OUTPUT_DIR / "sparse_features.npy", sparse_features)
+
+    # =========================================================================
+    # 5. Feature Importance Analysis
+    # =========================================================================
+
+    print("\n" + "=" * 60)
+    print("Step 5: Feature Importance Analysis")
+    print("=" * 60)
+
+    feature_names = list(processor.table_metag_filtered.columns)
+    taxonomy_for_analysis = taxonomy_df.set_index("genome_id")
+
+    importance_results = extractor.analyze_feature_importance(
+        original_feature_names=feature_names, taxonomy_df=taxonomy_for_analysis
+    )
+
+    if "importance_df" in importance_results:
+        importance_df = importance_results["importance_df"]
+        print("\nTop 10 most important features:")
+        print(importance_df.head(10)[["Feature", "Importance"]].to_string())
+
+        fig = plot_feature_importance(
+            importance_df,
+            top_n=20,
+            title="Top Microbiome Features by Importance",
+            save_path=OUTPUT_DIR / "feature_importance.png",
+        )
+
+        importance_df.to_csv(OUTPUT_DIR / "feature_importance.csv", index=False)
+
+    # =========================================================================
+    # 6. Reconstruction Quality
+    # =========================================================================
+
+    print("\n" + "=" * 60)
+    print("Step 6: Evaluating Reconstruction Quality")
+    print("=" * 60)
+
+    reconstructions = extractor.get_reconstruction(processed_data)
+
+    from sklearn.metrics import mean_squared_error, r2_score
+
+    mse = mean_squared_error(processed_data, reconstructions)
+    r2 = r2_score(processed_data.flatten(), reconstructions.flatten())
+
+    print(f"Reconstruction MSE: {mse:.4f}")
+    print(f"Reconstruction R²: {r2:.4f}")
+
+    fig = plot_reconstruction_comparison(
+        original=processed_data,
+        reconstructed=reconstructions,
+        n_samples=3,
+        n_features=30,
+        title="Original vs Reconstructed Profiles",
+        save_path=OUTPUT_DIR / "reconstruction_comparison.png",
+    )
+
+    # =========================================================================
+    # 7. Downstream Task Evaluation
+    # =========================================================================
+
+    print("\n" + "=" * 60)
+    print("Step 7: Evaluating Features on Downstream Classification")
+    print("=" * 60)
+
+    evaluator = FeatureEvaluator(task="classification", cv=5, scoring="accuracy", verbose=True)
+
+    feature_sets = {
+        "original": processed_data,
+        "vae_latent": latent_features,
+        "sparse_ae": sparse_features,
+    }
+
+    comparison_result = evaluator.compare_features(
+        feature_sets=feature_sets,
+        y=encoded_labels,
+        models=["logistic", "rf", "knn"],
+        scale_features=True,
+    )
+
+    print("\nFeature Comparison Results:")
+    print(comparison_result.results_df.to_string())
+
+    comparison_result.results_df.to_csv(OUTPUT_DIR / "feature_comparison.csv", index=False)
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+
+    print("\n" + "=" * 60)
+    print("Summary")
+    print("=" * 60)
+    print(f"All outputs saved to: {OUTPUT_DIR.absolute()}")
+    print("\nBest downstream performance:")
+    results_df = comparison_result.results_df
+    best_idx = results_df["mean_score"].idxmax()
+    print(f"  Feature set: {results_df.loc[best_idx, 'feature_set']}")
+    print(f"  Model: {results_df.loc[best_idx, 'model_name']}")
+    print(f"  Accuracy: {results_df.loc[best_idx, 'mean_score']:.2%}")
+
+
+if __name__ == "__main__":
+    main()
