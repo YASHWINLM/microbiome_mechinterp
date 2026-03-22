@@ -257,41 +257,71 @@ class FeatureExtractor:
             latent_weights = self.vae_model.fc_mu.weight.data.cpu().numpy()
             
             # Get first encoder layer weights
+            # Handle different VAE architectures:
+            # - TranscriptomicsVAE uses encoder_layers (nn.ModuleList)
+            # - ConditionalTranscriptomicsVAE uses encoder (nn.Sequential)
             encoder_layers = []
-            for module in self.vae_model.encoder.modules():
-                if isinstance(module, nn.Linear):
-                    encoder_layers.append(module)
-            
+            if hasattr(self.vae_model, 'encoder_layers'):
+                # TranscriptomicsVAE style: encoder_layers is a ModuleList of Linear layers
+                for module in self.vae_model.encoder_layers:
+                    if isinstance(module, nn.Linear):
+                        encoder_layers.append(module)
+            elif hasattr(self.vae_model, 'encoder'):
+                # ConditionalTranscriptomicsVAE style: encoder is nn.Sequential
+                for module in self.vae_model.encoder.modules():
+                    if isinstance(module, nn.Linear):
+                        encoder_layers.append(module)
+
             if len(encoder_layers) == 0:
-                print("Warning: Could not find encoder layers")
+                print("Warning: Could not find encoder layers. Model must have 'encoder_layers' (ModuleList) or 'encoder' (Sequential) attribute.")
                 return {}
-            
+
             first_encoder_weights = encoder_layers[0].weight.data.cpu().numpy()
-            
+
             print(f"Weight shapes:")
             print(f"  Sparse -> Latent: {sparse_to_latent.shape}")
-            print(f"  Latent weights: {latent_weights.shape}")
-            print(f"  First encoder: {first_encoder_weights.shape}")
+            print(f"  Latent weights (fc_mu): {latent_weights.shape}")
+            print(f"  Number of encoder layers: {len(encoder_layers)}")
+            for i, layer in enumerate(encoder_layers):
+                print(f"  Encoder layer {i}: {layer.weight.shape}")
             print(f"  Original features: {len(original_feature_names)}")
-            
+
             # Check dimensions
             if first_encoder_weights.shape[1] != len(original_feature_names):
                 print(f"Warning: Dimension mismatch!")
                 print(f"  Expected: {first_encoder_weights.shape[1]}")
                 print(f"  Got: {len(original_feature_names)}")
-                
+
                 # Use minimum to avoid index errors
                 n_features = min(first_encoder_weights.shape[1], len(original_feature_names))
                 original_feature_names = original_feature_names[:n_features]
-                first_encoder_weights = first_encoder_weights[:, :n_features]
-            
+
             # Compute importance scores
             # Sparse activation importance
             sparse_importance = np.abs(sparse_to_latent).mean(axis=0)
-            
-            # Weight importance through VAE
-            latent_to_input = np.abs(latent_weights.T @ first_encoder_weights)
-            input_importance = latent_to_input.mean(axis=0)
+
+            # Chain weight matrices through all encoder layers to map latent -> input
+            # Start with fc_mu transposed: (hidden_last, latent_dim)
+            # Then multiply through encoder layers in reverse order
+            # Final result maps from input_dim to latent_dim
+
+            # Build the chained weight matrix from latent back to input
+            # fc_mu: (latent_dim, hidden_last) -> transpose to (hidden_last, latent_dim)
+            chained_weights = np.abs(latent_weights.T)
+
+            # Multiply through encoder layers in reverse order
+            for layer in reversed(encoder_layers):
+                layer_weights = layer.weight.data.cpu().numpy()
+                # layer_weights: (output_dim, input_dim) -> transpose to (input_dim, output_dim)
+                chained_weights = np.abs(layer_weights.T) @ chained_weights
+
+            # chained_weights is now (input_dim, latent_dim)
+            # Take mean across latent dimensions to get per-input importance
+            input_importance = chained_weights.mean(axis=1)
+
+            # Truncate if needed due to earlier dimension mismatch
+            if len(input_importance) > len(original_feature_names):
+                input_importance = input_importance[:len(original_feature_names)]
             
             # Combined importance
             combined_importance = input_importance
@@ -329,7 +359,8 @@ class FeatureExtractor:
                 'weights': {
                     'sparse_to_latent': sparse_to_latent,
                     'latent_weights': latent_weights,
-                    'first_encoder': first_encoder_weights
+                    'first_encoder': first_encoder_weights,
+                    'chained_weights': chained_weights
                 }
             }
             
